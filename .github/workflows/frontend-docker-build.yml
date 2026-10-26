@@ -1,0 +1,164 @@
+name: Frontend pipeline
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-docker-build.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-docker-build.yml"
+
+jobs:
+  collect_metadata:
+    name: Collect Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      build_info: ${{ steps.metadata.outputs.build_info }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect GitHub Metadata
+        id: metadata
+        run: |
+          echo "GIT_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_ENV
+
+          echo "build_info=$(cat << EOF | jq -c .
+          {
+            "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "git": {
+              "commit": "${{ github.sha }}",
+              "branch": "${{ github.ref_name }}",
+              "repository": "${{ github.repository }}",
+              "workflow": "${{ github.workflow }}"
+            },
+            "pull_request": {
+              "number": "${{ github.event.pull_request.number }}",
+              "title": "${{ github.event.pull_request.title }}",
+              "base_branch": "${{ github.event.pull_request.base.ref }}",
+              "author": "${{ github.event.pull_request.user.login }}"
+            },
+            "linked_issues": "${{ toJSON(github.event.pull_request.body) }}"
+          }
+          EOF
+          )" >> $GITHUB_OUTPUT
+
+  build_test:
+    name: Build Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: yarn
+          cache-dependency-path: frontend/yarn.lock
+      - name: Install yarn
+        run: npm install -g yarn@1.22.22
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --ignore-scripts
+      - name: Build application
+        run: yarn run build
+
+  build_and_push:
+    name: Build And Push
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: [collect_metadata]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract branch name
+        id: extract_branch
+        shell: bash
+        run: |
+          echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
+          echo "Branch name: ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+
+      - name: Build timestamp
+        id: timestamp
+        run: echo "timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Image Description
+        id: description
+        run: |
+          DESCRIPTION=$(cat << EOF
+          Frontend built from branch: ${{ steps.extract_branch.outputs.branch }}
+
+          Commit: ${{ github.sha }}
+          Build Time: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+
+          Pull Request: ${{ github.event.pull_request.title }}
+          Author: ${{ github.event.pull_request.user.login }}
+
+          Build Info: '${{ needs.collect_metadata.outputs.build_info }}'
+          EOF
+          )
+
+          echo "description<<EOF" >> $GITHUB_OUTPUT
+          echo "$DESCRIPTION" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Get lowercase repository name
+        run: echo "REPO_LOWERCASE=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ env.REPO_LOWERCASE }}/frontend:latest
+            ghcr.io/${{ env.REPO_LOWERCASE }}/frontend:${{ github.sha }}
+          build-args: |
+            VITE_BACKEND_API_URL=${{ vars.VITE_BACKEND_API_URL || 'http://localhost:8000' }}
+            VITE_REACT_APP_SOURCES=${{ vars.VITE_REACT_APP_SOURCES || 'local,wiki,s3' }}
+            VITE_LLM_MODELS=${{ vars.VITE_LLM_MODELS }}
+            VITE_GOOGLE_CLIENT_ID=${{ vars.VITE_GOOGLE_CLIENT_ID }}
+            VITE_BLOOM_URL=${{ vars.VITE_BLOOM_URL || 'https://workspace-preview.neo4j.io/workspace/explore?connectURL={CONNECT_URL}&search=Show+me+a+graph&featureGenAISuggestions=true&featureGenAISuggestionsInternal=true' }}
+            VITE_TIME_PER_PAGE=${{ vars.VITE_TIME_PER_PAGE || '50' }}
+            VITE_LARGE_FILE_SIZE=${{ vars.VITE_LARGE_FILE_SIZE || '5242880' }}
+            VITE_CHUNK_SIZE=${{ vars.VITE_CHUNK_SIZE || '5242880' }}
+            VITE_CHAT_MODES=${{ vars.VITE_CHAT_MODES }}
+            VITE_ENV=${{ vars.VITE_ENV || 'PROD' }}
+            VITE_BATCH_SIZE=${{ vars.VITE_BATCH_SIZE || '2' }}
+            VITE_LLM_MODELS_PROD=${{ vars.VITE_LLM_MODELS_PROD || 'gemini_3.8_flash,openai_gpt_6_luna,diffbot,anthropic_claude_5.5_haiku' }}
+            VITE_AUTH0_CLIENT_ID=${{ vars.VITE_AUTH0_CLIENT_ID }}
+            VITE_AUTH0_DOMAIN=${{ vars.VITE_AUTH0_DOMAIN }}
+            VITE_SKIP_AUTH=${{ vars.VITE_SKIP_AUTH || 'false' }}
+            VITE_CHUNK_OVERLAP=${{ vars.VITE_CHUNK_OVERLAP || '20' }}
+            VITE_TOKENS_PER_CHUNK=${{ vars.VITE_TOKENS_PER_CHUNK || '200' }}
+            VITE_CHUNK_TO_COMBINE=${{ vars.VITE_CHUNK_TO_COMBINE || '1' }}
+            DEPLOYMENT_ENV=${{ vars.DEPLOYMENT_ENV || 'prod' }}
+          labels: |
+            org.opencontainers.image.title=LLM Graph Builder Frontend
+            org.opencontainers.image.description=${{ steps.description.outputs.description }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.timestamp.outputs.timestamp }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+            com.github.repo.branch=${{ steps.extract_branch.outputs.branch }}
+            com.github.build_info=${{ needs.collect_metadata.outputs.build_info }}
